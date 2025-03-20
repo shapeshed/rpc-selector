@@ -18,7 +18,7 @@ func main() {
 	logger, _ := cfg.Build()
 	defer logger.Sync() // Flush logs before exit
 
-	customRPCs := []string{"https://rpc-osmosis.margined.io"}
+	customRPCs := []string{"https://rpc-osmosiss.margined.io"}
 
 	// Initialize RPC Monitor with the same logger
 	monitor := rpcchecker.NewRPCMonitor(

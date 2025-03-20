@@ -2,61 +2,87 @@ package rpcchecker
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
-	"strings"
+	// "strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	"github.com/gorilla/websocket"
 	// ctypes "github.com/cometbft/cometbft/rpc/core/types"
 	"go.uber.org/zap"
 )
 
-// RPCNode represents an RPC endpoint
+// RPCNode represents an RPC endpoint.
 type RPCNode struct {
 	Address  string `json:"address"`
 	Provider string `json:"provider,omitempty"`
 }
 
-// ChainRegistry represents the chain.json format
+// ChainRegistry represents the chain.json format.
 type ChainRegistry struct {
 	APIs struct {
 		RPC []RPCNode `json:"rpc"`
 	} `json:"apis"`
 }
 
-// RPCMonitor dynamically monitors healthy RPC endpoints
+// RPCMonitor dynamically monitors healthy RPC endpoints.
 type RPCMonitor struct {
 	chainRegistryURL string
 	customRPCs       []string
 	healthy          []RPCNode
+	logger           *zap.Logger
 	cacheMu          sync.RWMutex
 	stopChan         chan struct{}
-	logger           *zap.Logger
+	// failedNodes maps node addresses to the time until which they are banned.
+	failedNodes map[string]time.Time
 }
 
-// NewRPCMonitor initializes a new RPC monitor
+// NewRPCMonitor initializes a new RPC monitor with a registry URL and custom RPCs.
 func NewRPCMonitor(chainRegistryURL string, customRPCs []string, logger *zap.Logger) *RPCMonitor {
 	return &RPCMonitor{
 		chainRegistryURL: chainRegistryURL,
 		customRPCs:       customRPCs,
 		stopChan:         make(chan struct{}),
 		logger:           logger,
+		failedNodes:      make(map[string]time.Time),
 	}
 }
 
-// fetchAndUpdateHealthyNodes retrieves RPCs, checks health, and sorts by response time
-func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
+// MarkNodeUnhealthy marks a node as unhealthy for the given duration.
+func (m *RPCMonitor) MarkNodeUnhealthy(address string, banDuration time.Duration) {
+	m.cacheMu.Lock()
+	defer m.cacheMu.Unlock()
+	m.failedNodes[address] = time.Now().Add(banDuration)
+	m.logger.Info("Marking node as unhealthy", zap.String("address", address), zap.Duration("banDuration", banDuration))
+}
+
+// GetHealthyNodes returns the healthy RPC nodes, filtering out nodes that are currently banned.
+func (m *RPCMonitor) GetHealthyNodes() []RPCNode {
+	m.cacheMu.RLock()
+	defer m.cacheMu.RUnlock()
+	now := time.Now()
+	filtered := []RPCNode{}
+	for _, node := range m.healthy {
+		if banUntil, exists := m.failedNodes[node.Address]; exists {
+			if now.Before(banUntil) {
+				continue // Skip this node—it’s still banned.
+			}
+		}
+		filtered = append(filtered, node)
+	}
+	return filtered
+}
+
+// fetchAndUpdateHealthyNodes retrieves RPC endpoints, checks their health, and sorts by response time.
+func (m *RPCMonitor) fetchAndUpdateHealthyNodes() error {
 	m.logger.Info("Fetching RPC List")
 
-	// Fetch RPCs from registry if URL is provided
+	// Get RPCs from registry if URL is provided.
 	var rpcList []RPCNode
 	if m.chainRegistryURL != "" {
 		m.logger.Info("Fetching from chain registry", zap.String("url", m.chainRegistryURL))
@@ -68,18 +94,16 @@ func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
 		}
 	}
 
-	// Add custom RPCs
+	// Add custom RPCs.
 	for _, rpc := range m.customRPCs {
 		rpcList = append(rpcList, RPCNode{Address: rpc})
 	}
 
-	// Deduplicate
+	// Deduplicate.
 	rpcMap := make(map[string]RPCNode)
 	for _, rpc := range rpcList {
 		rpcMap[rpc.Address] = rpc
 	}
-
-	// Convert back to slice
 	uniqueRPCs := make([]RPCNode, 0, len(rpcMap))
 	for _, rpc := range rpcMap {
 		uniqueRPCs = append(uniqueRPCs, rpc)
@@ -87,7 +111,7 @@ func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
 
 	if len(uniqueRPCs) == 0 {
 		m.logger.Warn("No RPC endpoints available after fetching")
-		return
+		return fmt.Errorf("no RPC endpoints available")
 	}
 
 	var wg sync.WaitGroup
@@ -98,13 +122,11 @@ func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
 
 	for _, node := range uniqueRPCs {
 		wg.Add(1)
-
 		go func(n RPCNode) {
 			defer wg.Done()
 			start := time.Now()
 			ok := m.checkHealth(n)
 			duration := time.Since(start)
-
 			if ok {
 				mu.Lock()
 				healthyNodes = append(healthyNodes, n)
@@ -113,6 +135,8 @@ func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
 			} else {
 				mu.Lock()
 				errorsEncountered++
+				// Optionally, mark node as unhealthy.
+				m.MarkNodeUnhealthy(n.Address, 2*time.Minute)
 				mu.Unlock()
 			}
 		}(node)
@@ -120,13 +144,12 @@ func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
 
 	wg.Wait()
 
-	// If all RPCs failed, log error and return
 	if len(healthyNodes) == 0 {
 		m.logger.Error("All RPC health checks failed", zap.Int("failed_count", errorsEncountered))
-		return
+		return fmt.Errorf("all RPC health checks failed")
 	}
 
-	// Sort healthy nodes by fastest response time
+	// Sort healthy nodes by fastest response time (ascending order).
 	sort.Slice(healthyNodes, func(i, j int) bool {
 		return responseTimes[healthyNodes[i].Address] < responseTimes[healthyNodes[j].Address]
 	})
@@ -135,14 +158,11 @@ func (m *RPCMonitor) fetchAndUpdateHealthyNodes() {
 	m.healthy = healthyNodes
 	m.cacheMu.Unlock()
 
-	m.logger.Info("Healthy RPC nodes updated",
-		zap.Int("healthy_count", len(m.healthy)),
-		zap.Int("failed_count", errorsEncountered),
-		zap.Any("healthy_nodes_sorted", healthyNodes),
-	)
+	m.logger.Info("Healthy RPC nodes updated", zap.Int("healthy_count", len(m.healthy)), zap.Int("failed_count", errorsEncountered))
+	return nil
 }
 
-// checkHealth verifies if an RPC node is alive and has a working WebSocket connection
+// checkHealth verifies if an RPC node is alive, has indexing enabled, and supports WebSocket.
 func (m *RPCMonitor) checkHealth(node RPCNode) bool {
 	client, err := rpchttp.New(node.Address)
 	if err != nil {
@@ -150,8 +170,8 @@ func (m *RPCMonitor) checkHealth(node RPCNode) bool {
 		return false
 	}
 
-	// Check status
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// Check status.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	status, err := client.Status(ctx)
 	if err != nil {
@@ -159,15 +179,13 @@ func (m *RPCMonitor) checkHealth(node RPCNode) bool {
 		return false
 	}
 
-	// Ensure indexing is enabled
 	if !status.TxIndexEnabled() {
 		m.logger.Warn("Indexing is disabled", zap.String("url", node.Address))
 		return false
 	}
 
-	// // Check WebSocket connectivity
+	// Check WebSocket connectivity.
 	if !m.checkWebSocket(node.Address) {
-		m.logger.Warn("WebSocket check failed", zap.String("url", node.Address))
 		return false
 	}
 
@@ -175,81 +193,25 @@ func (m *RPCMonitor) checkHealth(node RPCNode) bool {
 	return true
 }
 
-// JSON-RPC standard request
-type jsonRPCRequest struct {
-	Jsonrpc string `json:"jsonrpc"`
-	Method  string `json:"method"`
-	ID      int    `json:"id"`
-}
-
-// JSON-RPC standard response
-type jsonRPCResponse struct {
-	Jsonrpc string          `json:"jsonrpc"`
-	Result  json.RawMessage `json:"result"`
-	Error   *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
-}
-
-// checkWebSocket verifies WebSocket connectivity by sending a JSON-RPC request
+// checkWebSocket verifies WebSocket connectivity by converting the HTTP URL to a WS URL,
+// then performing a simple connection check.
 func (m *RPCMonitor) checkWebSocket(rpcAddress string) bool {
 	wsURL := convertToWebSocket(rpcAddress)
-	_, err := url.Parse(wsURL)
-	if err != nil {
-		m.logger.Warn("Invalid WebSocket URL", zap.String("url", wsURL), zap.Error(err))
-		return false
-	}
-
-	dialer := websocket.Dialer{
+	// Create a WebSocket dialer.
+	dialer := &websocket.Dialer{
 		HandshakeTimeout: 3 * time.Second,
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: false}, // Can be set to `true` for self-signed certs
 	}
-
 	conn, _, err := dialer.Dial(wsURL, nil)
 	if err != nil {
-		m.logger.Warn("Failed to connect to WebSocket", zap.String("url", wsURL), zap.Error(err))
+		m.logger.Warn("Failed to establish WebSocket connection", zap.String("url", wsURL), zap.Error(err))
 		return false
 	}
-	defer conn.Close()
-
-	// Set a short write timeout
-	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-
-	// Send a JSON-RPC status request
-	request := jsonRPCRequest{
-		Jsonrpc: "2.0",
-		Method:  "status",
-		ID:      1,
-	}
-	err = conn.WriteJSON(request)
-	if err != nil {
-		m.logger.Warn("WebSocket write failed", zap.String("url", wsURL), zap.Error(err))
-		return false
-	}
-
-	// Set a short read timeout
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-
-	// Read response
-	var response jsonRPCResponse
-	err = conn.ReadJSON(&response)
-	if err != nil {
-		m.logger.Warn("WebSocket did not respond correctly", zap.String("url", wsURL), zap.Error(err))
-		return false
-	}
-
-	// Check if response contains an error
-	if response.Error != nil {
-		m.logger.Warn("WebSocket RPC error", zap.String("url", wsURL), zap.String("message", response.Error.Message))
-		return false
-	}
-
-	m.logger.Info("WebSocket connection successful", zap.String("url", wsURL))
+	conn.Close()
+	m.logger.Debug("WebSocket connection successful", zap.String("url", wsURL))
 	return true
 }
 
-// fetchRPCFromRegistry fetches RPC endpoints from a chain registry JSON
+// fetchRPCFromRegistry fetches RPC endpoints from a chain registry JSON.
 func fetchRPCFromRegistry(url string) ([]RPCNode, error) {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -266,41 +228,37 @@ func fetchRPCFromRegistry(url string) ([]RPCNode, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse registry JSON: %w", err)
 	}
-
 	return registry.APIs.RPC, nil
 }
 
-// convertToWebSocket converts an HTTP URL to WebSocket (ws:// or wss://)
-func convertToWebSocket(httpURL string) string {
-	parsed, err := url.Parse(httpURL)
-	if err != nil {
-		return ""
+// convertToWebSocket converts an HTTP URL to the appropriate WebSocket URL.
+func convertToWebSocket(rpcAddress string) string {
+	parsed, err := url.Parse(rpcAddress)
+	if err != nil || parsed.Scheme == "" {
+		return "ws://" + rpcAddress + "/websocket"
 	}
-
-	if strings.HasPrefix(parsed.Scheme, "https") {
+	switch parsed.Scheme {
+	case "https":
 		return "wss://" + parsed.Host + "/websocket"
+	case "http":
+		return "ws://" + parsed.Host + "/websocket"
+	default:
+		return "ws://" + parsed.Host + "/websocket"
 	}
-
-	return "ws://" + parsed.Host + "/websocket"
 }
 
-// StartBackgroundRefresher runs periodic monitoring
+// StartBackgroundRefresher runs periodic monitoring.
 func (m *RPCMonitor) StartBackgroundRefresher(interval time.Duration) {
 	m.logger.Info("Starting background RPC check")
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		m.fetchAndUpdateHealthyNodes() // Run immediately on startup
-
+		m.fetchAndUpdateHealthyNodes() // Run immediately on startup.
 		for {
 			select {
 			case <-ticker.C:
-				m.logger.Info("Refreshing RPC list")
 				m.fetchAndUpdateHealthyNodes()
-				// if err != nil {
-				// 	m.logger.Warn("Failed to refresh RPC list", zap.Error(err))
-				// }
 			case <-m.stopChan:
 				m.logger.Info("Stopping RPC monitor refresher")
 				return
@@ -309,14 +267,7 @@ func (m *RPCMonitor) StartBackgroundRefresher(interval time.Duration) {
 	}()
 }
 
-// StopBackgroundRefresher stops monitoring
+// StopBackgroundRefresher stops monitoring.
 func (m *RPCMonitor) StopBackgroundRefresher() {
 	close(m.stopChan)
-}
-
-// GetHealthyNodes returns the list of healthy RPCs
-func (m *RPCMonitor) GetHealthyNodes() []RPCNode {
-	m.cacheMu.RLock()
-	defer m.cacheMu.RUnlock()
-	return m.healthy
 }

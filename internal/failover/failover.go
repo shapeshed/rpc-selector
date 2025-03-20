@@ -62,7 +62,7 @@ func (c *FailoverRPCClient) selectHealthyNode() {
 	if err != nil {
 		panic(err)
 	}
-	httpClient.Timeout = 150 * time.Millisecond
+	httpClient.Timeout = 1000 * time.Millisecond
 
 	rpcClient, err := rpchttp.NewWithClient(newNode.Address, httpClient)
 	if err != nil {
