@@ -14,7 +14,13 @@ The service
 - Sorts healthy nodes by response time
 - Bans unhealthy nodes for a certain period of time
 
-Consumers can use it like this, calling `failoverClient.Failover()` within an error to switch the `failoverClient` to another node.
+## Demo
+
+Run `go run main.go` to see it working.
+
+## Usage
+
+Consumers can use it like this, calling `rpcClient.Failover()` within an error to switch the `rpcClient` to another node.
 
 ```go
 monitor := rpcchecker.NewRPCMonitor(
@@ -40,7 +46,7 @@ rpcClient := failover.NewFailoverRPCClient(monitor, logger)
 
 ctx := context.Background()
 
-status, err := failoverClient.Client().Status(ctx)
+status, err := rpcClient.Client().Status(ctx)
 if err != nil {
 	logger.Warn("Failed to get status", zap.Error(err))
   rpcClient.Failover()
